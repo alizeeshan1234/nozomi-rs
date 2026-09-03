@@ -3,7 +3,11 @@
 //! Pulls the newest signatures touching every Nozomi tip account, then samples
 //! full transactions to measure intended vs paid tips and fees burned on reverts.
 //!
-//! SOLANA_RPC_URL=https://... cargo run --example scan -- [sigs_per_account=200] [sample_txs=60]
+//! SOLANA_RPC_URL=https://... cargo run --example scan -- [window_secs=300] [sample_txs=60]
+//!
+//! Signatures are paged per tip account until `window_secs` of block time is
+//! covered, so the landed/reverted split is over a real window rather than a
+//! fixed count. Full-transaction sampling needs a paid RPC; public RPC rate limits it.
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -14,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rpc = std::env::var("SOLANA_RPC_URL")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
     let mut args = std::env::args().skip(1);
-    let per_account: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let window_secs: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(300);
     let sample_n: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(60);
     let pause = Duration::from_millis(
         std::env::var("RPC_PAUSE_MS")
@@ -25,15 +29,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let v = Verifier::new(rpc);
     let mut all = Vec::new();
+    let mut newest_time: Option<i64> = None;
     for acct in TIP_ACCOUNTS {
-        match v.signatures_for(acct, per_account, None).await {
-            Ok(sigs) => {
-                eprintln!("{acct}: {} sigs", sigs.len());
-                all.extend(sigs);
+        let mut before: Option<String> = None;
+        let mut got = 0usize;
+        loop {
+            let page = match v.signatures_for(acct, 1000, before.as_deref()).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{acct}: error {e}");
+                    break;
+                }
+            };
+            tokio::time::sleep(pause).await;
+            if page.is_empty() {
+                break;
             }
-            Err(e) => eprintln!("{acct}: error {e}"),
+            if newest_time.is_none() {
+                newest_time = page.iter().filter_map(|s| s.block_time).max();
+            }
+            let cutoff = newest_time.unwrap_or(0) - window_secs;
+            let oldest = page.iter().filter_map(|s| s.block_time).min().unwrap_or(0);
+            let last_sig = page.last().map(|s| s.signature.clone());
+            got += page.len();
+            all.extend(
+                page.into_iter()
+                    .filter(|s| s.block_time.unwrap_or(0) >= cutoff),
+            );
+            if oldest < cutoff || got >= 20_000 {
+                break;
+            }
+            before = last_sig;
         }
-        tokio::time::sleep(pause).await;
+        eprintln!("{acct}: {got} sigs fetched");
     }
     all.sort_by_key(|s| std::cmp::Reverse(s.slot));
     all.dedup_by(|a, b| a.signature == b.signature);
@@ -64,6 +92,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reverted,
         pct(reverted, total)
     );
+
+    let mut errs: BTreeMap<String, usize> = BTreeMap::new();
+    for s in all.iter().filter(|s| !s.succeeded()) {
+        let key = s
+            .err
+            .as_ref()
+            .map(|e| {
+                // Collapse {"InstructionError":[idx,{"Custom":n}]} to "Custom(n)" so bursts show up.
+                e.pointer("/InstructionError/1")
+                    .map(|inner| inner.to_string())
+                    .unwrap_or_else(|| e.to_string())
+            })
+            .unwrap_or_default();
+        *errs.entry(key).or_default() += 1;
+    }
+    let mut errs: Vec<_> = errs.into_iter().collect();
+    errs.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    println!("top revert reasons:");
+    for (k, n) in errs.iter().take(6) {
+        println!("  {:>6}  {k}", n);
+    }
 
     let mut per_slot: BTreeMap<u64, usize> = BTreeMap::new();
     for s in &all {
