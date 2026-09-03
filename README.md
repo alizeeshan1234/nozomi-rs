@@ -61,6 +61,10 @@ Every send is a `tracing` span with `region`, `bytes`, and `tip_lamports`. `Clie
 
 All nine regions with direct (`http`/`https`) and Cloudflare routes, plus `Region::Auto`. See `Region::base_url`.
 
+## What the chain says about Nozomi traffic
+
+See [FINDINGS.md](FINDINGS.md): over an hour of mainnet, 99.1% of Nozomi-tipped transactions reverted, and reverted transactions pay no tip despite what the docs say.
+
 ## Status
 
 0.1. API may change before 1.0. Not affiliated with Temporal.
