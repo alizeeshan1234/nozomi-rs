@@ -149,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut n_ok = 0usize;
     let mut n_rev = 0usize;
     let mut tips_ok: Vec<u64> = Vec::new();
+    let mut tips_rev: Vec<u64> = Vec::new();
     for s in succ.iter().chain(rev.iter()) {
         match v.report(&s.signature, None).await {
             Ok(r) => {
@@ -162,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     intended_rev += r.tip_intended_lamports;
                     paid_rev += r.tip_paid_lamports;
                     fee_rev += r.fee_lamports;
+                    tips_rev.push(r.tip_intended_lamports);
                 }
             }
             Err(e) => eprintln!("{}: {e}", s.signature),
@@ -169,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(pause).await;
     }
     tips_ok.sort_unstable();
+    tips_rev.sort_unstable();
 
     println!("\n== Sample of {} full transactions ==", n_ok + n_rev);
     println!(
@@ -190,6 +193,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sol(paid_rev),
         sol(fee_rev)
     );
+    if !tips_rev.is_empty() {
+        println!(
+            "  intended tip p50 {:.4} SOL, p90 {:.4} SOL, max {:.4} SOL",
+            sol(pctl(&tips_rev, 50)),
+            sol(pctl(&tips_rev, 90)),
+            sol(*tips_rev.last().unwrap())
+        );
+    }
     if n_rev > 0 && paid_rev == 0 {
         println!("\nEvery sampled revert paid 0 tip. The tip is rolled back with the transaction; only fees are charged.");
     }
