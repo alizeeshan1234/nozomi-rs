@@ -1,8 +1,14 @@
 //! Landing verification against any Solana RPC.
 //!
 //! Nozomi's API v2 returns nothing but a 200. This module answers the questions
-//! that matter afterwards: did it land, in which slot, which tip account got paid,
-//! how much, and did the transaction revert while still paying the tip.
+//! that matter afterwards: did it land, in which slot, which tip account was
+//! targeted, how much was *intended* as tip, and how much was *actually paid*.
+//!
+//! Those last two differ on a reverted transaction. Solana transactions are
+//! atomic: if any instruction fails, every instruction is rolled back, including
+//! the tip transfer. Only the base and priority fee are charged. Nozomi's docs
+//! state that a reverted transaction "still pays" the tip; on-chain balances show
+//! it does not. This module reports both numbers so you can see it yourself.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,31 +28,43 @@ pub struct LandingReport {
     pub succeeded: bool,
     /// The on-chain error, stringified, when `succeeded` is false.
     pub error: Option<String>,
-    /// Base fee paid, in lamports.
+    /// Base plus priority fee paid, in lamports. Charged even on revert.
     pub fee_lamports: u64,
     /// Compute units consumed, if reported.
     pub compute_units: Option<u64>,
-    /// Nozomi tip account that was paid, if any.
+    /// Nozomi tip account targeted by the tip instruction, if any.
     pub tip_account: Option<String>,
-    /// Total lamports transferred to Nozomi tip accounts.
-    pub tip_lamports: u64,
+    /// Lamports the tip instruction(s) would transfer. What you *bid*.
+    pub tip_intended_lamports: u64,
+    /// Lamports that actually arrived at Nozomi tip accounts, from pre/post
+    /// balances. What you *paid*. Zero on revert.
+    pub tip_paid_lamports: u64,
     /// Slots between `submitted_slot` (if given) and inclusion.
     pub slots_after_submit: Option<u64>,
 }
 
 impl LandingReport {
-    /// True when the transaction reverted but the tip transfer still executed.
-    /// Nozomi charges in this case because the tip is an instruction in your own
-    /// transaction. This is the case worth alerting on.
-    pub fn tipped_but_reverted(&self) -> bool {
-        !self.succeeded && self.tip_lamports > 0
+    /// True if the transaction carried a tip instruction to a Nozomi account.
+    pub fn went_through_nozomi(&self) -> bool {
+        self.tip_intended_lamports > 0
     }
 
-    /// True when the transaction landed with no tip to any Nozomi account, which
-    /// means it did not go through Nozomi at all (or the tip was routed through a
-    /// lookup table this scan cannot resolve).
-    pub fn landed_without_tip(&self) -> bool {
-        self.tip_lamports == 0
+    /// True when the transaction reverted and, as Solana's atomicity requires,
+    /// the tip was rolled back with it. You paid `fee_lamports` and nothing else.
+    pub fn reverted_tip_refunded(&self) -> bool {
+        !self.succeeded && self.tip_intended_lamports > 0 && self.tip_paid_lamports == 0
+    }
+
+    /// True when the tip was actually charged. Only happens on success.
+    pub fn tip_charged(&self) -> bool {
+        self.tip_paid_lamports > 0
+    }
+
+    /// True when a tip landed at a Nozomi account without a matching top-level
+    /// instruction (for example via a lookup-table address or CPI this scan does
+    /// not attribute). Worth a look if it ever happens.
+    pub fn tip_paid_without_instruction(&self) -> bool {
+        self.tip_paid_lamports > 0 && self.tip_intended_lamports == 0
     }
 }
 
@@ -56,6 +74,23 @@ impl LandingReport {
 pub struct Verifier {
     http: reqwest::Client,
     rpc_url: String,
+}
+
+/// One entry from `getSignaturesForAddress`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignatureInfo {
+    pub signature: String,
+    pub slot: u64,
+    #[serde(default)]
+    pub err: Option<Value>,
+    #[serde(default, rename = "blockTime")]
+    pub block_time: Option<i64>,
+}
+
+impl SignatureInfo {
+    pub fn succeeded(&self) -> bool {
+        self.err.is_none()
+    }
 }
 
 impl Verifier {
@@ -110,6 +145,23 @@ impl Verifier {
             .ok_or_else(|| Error::Decode(format!("getSlot returned {v}")))
     }
 
+    /// Recent signatures that touched `address`, newest first. `before` pages backwards.
+    pub async fn signatures_for(
+        &self,
+        address: &str,
+        limit: usize,
+        before: Option<&str>,
+    ) -> crate::Result<Vec<SignatureInfo>> {
+        let mut opts = json!({ "limit": limit.min(1000), "commitment": "confirmed" });
+        if let Some(b) = before {
+            opts["before"] = json!(b);
+        }
+        let v = self
+            .rpc("getSignaturesForAddress", json!([address, opts]))
+            .await?;
+        serde_json::from_value(v).map_err(|e| Error::Decode(format!("signatures: {e}")))
+    }
+
     /// Fetch a confirmed transaction and report on it. `submitted_slot` is optional;
     /// pass the slot you observed just before sending to get `slots_after_submit`.
     pub async fn report(
@@ -142,7 +194,8 @@ pub fn parse_report(signature: &str, result: &Value, submitted_slot: Option<u64>
     let fee_lamports = meta.get("fee").and_then(|f| f.as_u64()).unwrap_or(0);
     let compute_units = meta.get("computeUnitsConsumed").and_then(|c| c.as_u64());
 
-    let mut tip_lamports = 0u64;
+    // Intended tip: system transfers to tip accounts in the instruction list.
+    let mut tip_intended = 0u64;
     let mut tip_account = None;
     let mut visit = |ix: &Value| {
         let Some(parsed) = ix.get("parsed") else {
@@ -161,13 +214,11 @@ pub fn parse_report(signature: &str, result: &Value, submitted_slot: Option<u64>
         if !is_tip_account(dest) {
             return;
         }
-        let lamports = info.get("lamports").and_then(|l| l.as_u64()).unwrap_or(0);
-        tip_lamports += lamports;
+        tip_intended += info.get("lamports").and_then(|l| l.as_u64()).unwrap_or(0);
         if tip_account.is_none() {
             tip_account = Some(dest.to_string());
         }
     };
-
     if let Some(ixs) = result
         .pointer("/transaction/message/instructions")
         .and_then(|i| i.as_array())
@@ -186,11 +237,44 @@ pub fn parse_report(signature: &str, result: &Value, submitted_slot: Option<u64>
         }
     }
 
-    // A reverted transaction still records its instructions, but only the tip
-    // transfer "counts" if it actually moved lamports. On revert nothing moves,
-    // yet Nozomi still charges by the docs' own description because the tip is
-    // in the transaction. We report the *intended* tip so the caller can see what
-    // was at stake, and `tipped_but_reverted` flags it.
+    // Paid tip: balance deltas on any tip account in the account list.
+    let keys: Vec<String> = result
+        .pointer("/transaction/message/accountKeys")
+        .and_then(|k| k.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|k| {
+                    k.get("pubkey")
+                        .and_then(|p| p.as_str())
+                        .or_else(|| k.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pre = meta
+        .get("preBalances")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let post = meta
+        .get("postBalances")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut tip_paid = 0u64;
+    for (i, key) in keys.iter().enumerate() {
+        if !is_tip_account(key) {
+            continue;
+        }
+        let p0 = pre.get(i).and_then(|v| v.as_u64()).unwrap_or(0);
+        let p1 = post.get(i).and_then(|v| v.as_u64()).unwrap_or(0);
+        tip_paid += p1.saturating_sub(p0);
+        if tip_account.is_none() && p1 > p0 {
+            tip_account = Some(key.clone());
+        }
+    }
+
     LandingReport {
         signature: signature.to_string(),
         slot,
@@ -200,7 +284,8 @@ pub fn parse_report(signature: &str, result: &Value, submitted_slot: Option<u64>
         fee_lamports,
         compute_units,
         tip_account,
-        tip_lamports,
+        tip_intended_lamports: tip_intended,
+        tip_paid_lamports: tip_paid,
         slots_after_submit: submitted_slot.map(|s| slot.saturating_sub(s)),
     }
 }
@@ -209,51 +294,62 @@ pub fn parse_report(signature: &str, result: &Value, submitted_slot: Option<u64>
 mod tests {
     use super::*;
 
-    fn sample(err: Value) -> Value {
+    fn sample(err: Value, tip_post: u64) -> Value {
         json!({
             "slot": 100,
             "blockTime": 1700000000,
-            "meta": { "err": err, "fee": 5000, "computeUnitsConsumed": 1200, "innerInstructions": [] },
-            "transaction": { "message": { "instructions": [
+            "meta": { "err": err, "fee": 5000, "computeUnitsConsumed": 1200, "innerInstructions": [],
+                      "preBalances": [10_000_000, 500, 0], "postBalances": [10_000_000 - 5000 - (tip_post - 500), tip_post, 0] },
+            "transaction": { "message": {
+                "accountKeys": [ { "pubkey": "Payer111111111111111111111111111111111111111" },
+                                 { "pubkey": crate::TIP_ACCOUNTS[3] },
+                                 { "pubkey": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4" } ],
+                "instructions": [
                 { "program": "system", "programId": "11111111111111111111111111111111",
-                  "parsed": { "type": "transfer", "info": { "source": "A", "destination": crate::TIP_ACCOUNTS[3], "lamports": 1500000 } } },
+                  "parsed": { "type": "transfer", "info": { "source": "Payer", "destination": crate::TIP_ACCOUNTS[3], "lamports": 1500000 } } },
                 { "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "accounts": [], "data": "x" }
             ] } }
         })
     }
 
     #[test]
-    fn parses_success_with_tip() {
-        let r = parse_report("sig", &sample(Value::Null), Some(98));
+    fn success_pays_intended_tip() {
+        let r = parse_report("sig", &sample(Value::Null, 500 + 1_500_000), Some(98));
         assert!(r.succeeded);
-        assert_eq!(r.tip_lamports, 1_500_000);
+        assert_eq!(r.tip_intended_lamports, 1_500_000);
+        assert_eq!(r.tip_paid_lamports, 1_500_000);
+        assert!(r.tip_charged());
+        assert!(!r.reverted_tip_refunded());
         assert_eq!(r.tip_account.as_deref(), Some(crate::TIP_ACCOUNTS[3]));
         assert_eq!(r.slots_after_submit, Some(2));
-        assert_eq!(r.fee_lamports, 5000);
-        assert_eq!(r.compute_units, Some(1200));
-        assert!(!r.tipped_but_reverted());
     }
 
     #[test]
-    fn flags_revert_with_tip() {
+    fn revert_rolls_back_tip() {
+        // Balance on the tip account unchanged: the tip was intended but never paid.
         let r = parse_report(
             "sig",
-            &sample(json!({ "InstructionError": [1, "Custom"] })),
+            &sample(json!({ "InstructionError": [1, "Custom"] }), 500),
             None,
         );
         assert!(!r.succeeded);
-        assert!(r.tipped_but_reverted());
-        assert_eq!(r.slots_after_submit, None);
-        assert!(r.error.unwrap().contains("InstructionError"));
+        assert_eq!(r.tip_intended_lamports, 1_500_000);
+        assert_eq!(r.tip_paid_lamports, 0);
+        assert!(r.reverted_tip_refunded());
+        assert!(!r.tip_charged());
+        assert_eq!(r.fee_lamports, 5000);
     }
 
     #[test]
     fn no_tip_when_destination_is_not_nozomi() {
-        let mut v = sample(Value::Null);
+        let mut v = sample(Value::Null, 500);
         v["transaction"]["message"]["instructions"][0]["parsed"]["info"]["destination"] =
             json!("SomeoneElse111111111111111111111111111111111");
+        v["transaction"]["message"]["accountKeys"][1]["pubkey"] =
+            json!("SomeoneElse111111111111111111111111111111111");
         let r = parse_report("sig", &v, None);
-        assert_eq!(r.tip_lamports, 0);
-        assert!(r.landed_without_tip());
+        assert_eq!(r.tip_intended_lamports, 0);
+        assert_eq!(r.tip_paid_lamports, 0);
+        assert!(!r.went_through_nozomi());
     }
 }

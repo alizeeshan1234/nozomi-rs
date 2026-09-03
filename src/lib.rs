@@ -17,8 +17,10 @@
 //! * **Batch framing done right.** Length-prefixed framing, size and count limits
 //!   enforced locally, and the stream-processing semantics documented on the type.
 //! * **Landing verification.** Give it a signature and a Solana RPC and it tells
-//!   you the slot it landed in, which tip account was paid, how much, and whether
-//!   the transaction reverted while still paying the tip.
+//!   you the slot it landed in, which tip account was targeted, what tip was
+//!   intended, and what tip was actually paid from on-chain balances. On a
+//!   revert those differ: the tip is rolled back with the transaction and only
+//!   the fee is charged, whatever the docs say.
 //! * **Tracing built in.** Every send is a span with region, byte size and tip
 //!   lamports, and the client keeps running counters you can export.
 //!
@@ -50,7 +52,7 @@ pub use error::Error;
 pub use region::{Region, Route};
 pub use tip::{MIN_TIP_LAMPORTS, TIP_ACCOUNTS};
 pub use tipfloor::TipFloor;
-pub use verify::{LandingReport, Verifier};
+pub use verify::{LandingReport, SignatureInfo, Verifier};
 
 /// Result alias for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
