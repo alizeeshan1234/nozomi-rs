@@ -1,16 +1,17 @@
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use reqwest::StatusCode;
 use serde_json::json;
 use tracing::{debug, instrument, warn};
 
 use crate::error::Error;
 use crate::region::{Region, Route};
 use crate::tipfloor::TipFloor;
+use crate::util::{encode_query_value, normalize_base_url, retry_after, REDACTED};
 use crate::{Result, MAX_BATCH_BODY_BYTES, MAX_BATCH_TXS, MAX_TX_BYTES, MIN_TX_BYTES};
 
 /// Base URL of the tip-floor API. Separate host from the send endpoints.
@@ -23,11 +24,12 @@ pub struct Stats {
     pub submitted: AtomicU64,
     /// Transactions the server answered 200 for.
     pub accepted: AtomicU64,
-    /// Sends that failed locally before any bytes left (tip or size checks).
+    /// Calls that failed locally before any bytes left (tip, size, or batch
+    /// checks). One per call, whatever the batch size.
     pub rejected_locally: AtomicU64,
     /// Sends that reached the server and were refused (4xx/5xx).
     pub rejected_by_server: AtomicU64,
-    /// Sends that failed at the transport layer.
+    /// Calls that failed at the transport layer, timeouts included.
     pub transport_errors: AtomicU64,
     /// Sum of round-trip microseconds for calls that got any HTTP response.
     pub roundtrip_micros: AtomicU64,
@@ -48,7 +50,9 @@ impl Stats {
 }
 
 /// Builder for [`Client`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` output redacts the API key.
+#[derive(Clone)]
 pub struct ClientBuilder {
     api_key: Option<String>,
     region: Region,
@@ -56,6 +60,21 @@ pub struct ClientBuilder {
     timeout: Duration,
     user_agent: String,
     tip_api_base: String,
+    base_url: Option<String>,
+}
+
+impl fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("api_key", &self.api_key.as_ref().map(|_| REDACTED))
+            .field("region", &self.region)
+            .field("route", &self.route)
+            .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
+            .field("tip_api_base", &self.tip_api_base)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl Default for ClientBuilder {
@@ -67,12 +86,14 @@ impl Default for ClientBuilder {
             timeout: Duration::from_secs(5),
             user_agent: format!("nozomi-client/{}", env!("CARGO_PKG_VERSION")),
             tip_api_base: TIP_API_BASE.to_string(),
+            base_url: None,
         }
     }
 }
 
 impl ClientBuilder {
-    /// Nozomi API key. Sent as the `c` query parameter, as the docs specify.
+    /// Nozomi API key. Sent percent-encoded as the `c` query parameter, as the
+    /// docs specify.
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
@@ -102,6 +123,13 @@ impl ClientBuilder {
         self.tip_api_base = base.into();
         self
     }
+    /// Override the send base URL (scheme + host, no trailing slash) instead of
+    /// deriving it from `region` and `route`. For tests, proxies, or a private
+    /// endpoint Temporal has given you.
+    pub fn base_url(mut self, base: impl Into<String>) -> Self {
+        self.base_url = Some(base.into());
+        self
+    }
 
     pub fn build(self) -> Result<Client> {
         let api_key = self
@@ -117,12 +145,18 @@ impl ClientBuilder {
             .pool_max_idle_per_host(4)
             .tcp_nodelay(true)
             .build()?;
+        let base_url = match self.base_url {
+            Some(b) => normalize_base_url("base_url", &b)?,
+            None => self.region.base_url(self.route),
+        };
+        let tip_api_base = normalize_base_url("tip_api_base", &self.tip_api_base)?;
         Ok(Client {
             inner: Arc::new(Inner {
                 http,
-                base_url: self.region.base_url(self.route),
-                tip_api_base: self.tip_api_base,
-                api_key,
+                base_url,
+                tip_api_base,
+                api_key_encoded: encode_query_value(&api_key),
+                timeout: self.timeout,
                 region: self.region,
                 route: self.route,
                 stats: Stats::default(),
@@ -131,12 +165,13 @@ impl ClientBuilder {
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     http: reqwest::Client,
     base_url: String,
     tip_api_base: String,
-    api_key: String,
+    /// Percent-encoded once at build time.
+    api_key_encoded: String,
+    timeout: Duration,
     region: Region,
     route: Route,
     stats: Stats,
@@ -144,9 +179,25 @@ struct Inner {
 
 /// A Nozomi client. Cheap to clone; clones share one connection pool and one set
 /// of counters.
-#[derive(Debug, Clone)]
+///
+/// `Debug` output redacts the API key. Transport errors have their URL stripped
+/// for the same reason: the key travels in the query string.
+#[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.inner.base_url)
+            .field("tip_api_base", &self.inner.tip_api_base)
+            .field("api_key", &REDACTED)
+            .field("region", &self.inner.region)
+            .field("route", &self.inner.route)
+            .field("stats", &self.inner.stats)
+            .finish()
+    }
 }
 
 /// Handle for the keep-alive task. Dropping it stops the pings.
@@ -187,7 +238,23 @@ impl Client {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}{}?c={}", self.inner.base_url, path, self.inner.api_key)
+        format!(
+            "{}{}?c={}",
+            self.inner.base_url, path, self.inner.api_key_encoded
+        )
+    }
+
+    /// Map a request failure, counting it and classifying timeouts.
+    fn transport(&self, e: reqwest::Error) -> Error {
+        self.inner
+            .stats
+            .transport_errors
+            .fetch_add(1, Ordering::Relaxed);
+        Error::from_reqwest(e, Some(self.inner.timeout))
+    }
+
+    fn decode(&self, e: reqwest::Error) -> Error {
+        Error::decode_reqwest(e, Some(self.inner.timeout))
     }
 
     fn check_size(&self, tx: &[u8]) -> Result<()> {
@@ -233,25 +300,9 @@ impl Client {
             .stats
             .rejected_by_server
             .fetch_add(1, Ordering::Relaxed);
-        let retry_after = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
+        let retry_after = retry_after(resp.headers());
         let body = resp.text().await.unwrap_or_default();
-        Err(match status {
-            StatusCode::UNAUTHORIZED => Error::Unauthorized,
-            StatusCode::TOO_MANY_REQUESTS => Error::RateLimited { retry_after },
-            StatusCode::BAD_REQUEST => Error::BadRequest(body),
-            s if s.is_server_error() => Error::Server {
-                status: s.as_u16(),
-                body,
-            },
-            s => Error::Http {
-                status: s.as_u16(),
-                body,
-            },
-        })
+        Err(Error::from_status(status, retry_after, body))
     }
 
     /// Send one signed transaction over API v2 (`POST /api/sendTransaction2`).
@@ -272,12 +323,7 @@ impl Client {
             .body(B64.encode(tx))
             .send()
             .await
-            .inspect_err(|_| {
-                self.inner
-                    .stats
-                    .transport_errors
-                    .fetch_add(1, Ordering::Relaxed);
-            })?;
+            .map_err(|e| self.transport(e))?;
         self.classify(resp, started).await?;
         self.inner.stats.accepted.fetch_add(1, Ordering::Relaxed);
         debug!(micros = started.elapsed().as_micros() as u64, "accepted");
@@ -306,17 +352,9 @@ impl Client {
             .json(&body)
             .send()
             .await
-            .inspect_err(|_| {
-                self.inner
-                    .stats
-                    .transport_errors
-                    .fetch_add(1, Ordering::Relaxed);
-            })?;
+            .map_err(|e| self.transport(e))?;
         let resp = self.classify(resp, started).await?;
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::Decode(e.to_string()))?;
+        let v: serde_json::Value = resp.json().await.map_err(|e| self.decode(e))?;
         if let Some(err) = v.get("error") {
             self.inner
                 .stats
@@ -344,6 +382,9 @@ impl Client {
     /// Frame transactions for `sendBatch`: `[len_hi][len_lo][bytes]...`, big-endian u16 lengths.
     /// Validates count, per-transaction size, and total body size before framing.
     pub fn frame_batch(txs: &[&[u8]]) -> Result<Vec<u8>> {
+        if txs.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
         if txs.len() > MAX_BATCH_TXS {
             return Err(Error::BatchTooLarge {
                 count: txs.len(),
@@ -404,12 +445,7 @@ impl Client {
             .body(body)
             .send()
             .await
-            .inspect_err(|_| {
-                self.inner
-                    .stats
-                    .transport_errors
-                    .fetch_add(1, Ordering::Relaxed);
-            })?;
+            .map_err(|e| self.transport(e))?;
         self.classify(resp, started).await?;
         self.inner
             .stats
@@ -425,27 +461,39 @@ impl Client {
             .http
             .get(format!("{}/ping", self.inner.base_url))
             .send()
-            .await?;
+            .await
+            .map_err(|e| Error::from_reqwest(e, Some(self.inner.timeout)))?;
         let status = resp.status();
         if status.is_success() {
             Ok(())
         } else {
-            Err(Error::Http {
-                status: status.as_u16(),
-                body: resp.text().await.unwrap_or_default(),
-            })
+            let body = resp.text().await.unwrap_or_default();
+            Err(Error::from_status(status, None, body))
         }
     }
 
     /// Spawn a task that pings every 60 seconds. The server closes idle
     /// connections after 65 seconds, so this keeps one warm connection ready for
     /// the next send. Drop the returned handle to stop.
+    ///
+    /// One ping keeps one connection warm. The pool holds up to four idle
+    /// connections per host, so a burst of concurrent sends after a quiet
+    /// minute pays a connect on all but one of them. If you send concurrently
+    /// and care about that, run one client per sending task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime, like `tokio::spawn`.
     pub fn spawn_keepalive(&self) -> KeepAlive {
         self.spawn_keepalive_every(Duration::from_secs(60))
     }
 
     /// Like [`spawn_keepalive`](Self::spawn_keepalive) with a custom interval.
     /// Don't go below the default without a reason; the docs ask you not to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside a tokio runtime, like `tokio::spawn`.
     pub fn spawn_keepalive_every(&self, interval: Duration) -> KeepAlive {
         let client = self.clone();
         let handle = tokio::spawn(async move {
@@ -462,36 +510,99 @@ impl Client {
     }
 
     /// Current landed-tip percentiles from `GET /tip_floor`.
+    ///
+    /// The API answers with `null` percentiles when it has no recent data and
+    /// has been seen to return 503 from nginx (both on 2026-09-07); the first is
+    /// an `Ok` with [`TipFloor::is_complete`] false, the second an
+    /// [`Error::Server`]. Size the tip from [`TipFloor::lamports`], which falls
+    /// back to the minimum, and keep the last good value on error.
     pub async fn tip_floor(&self) -> Result<TipFloor> {
         let resp = self
             .inner
             .http
             .get(format!("{}/tip_floor", self.inner.tip_api_base))
             .send()
-            .await?;
+            .await
+            .map_err(|e| Error::from_reqwest(e, Some(self.inner.timeout)))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(Error::Http {
-                status: status.as_u16(),
-                body: resp.text().await.unwrap_or_default(),
-            });
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::from_status(status, None, body));
         }
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::Decode(e.to_string()))?;
+        let v: serde_json::Value = resp.json().await.map_err(|e| self.decode(e))?;
         TipFloor::from_value(&v)
+    }
+
+    /// Open the websocket tip stream behind [`tip_floor`](Self::tip_floor), on
+    /// the same API host, authenticated with this client's key.
+    ///
+    /// The connect is bounded by this client's timeout; frames by
+    /// [`DEFAULT_READ_TIMEOUT`](crate::tipstream::DEFAULT_READ_TIMEOUT).
+    #[cfg(feature = "tip-stream")]
+    pub async fn tip_stream(&self) -> Result<crate::tipstream::TipStream> {
+        crate::tipstream::TipStream::connect_with(
+            &self.tip_stream_url(),
+            self.inner.timeout,
+            crate::tipstream::DEFAULT_READ_TIMEOUT,
+        )
+        .await
+    }
+
+    /// A reconnecting background subscription to the tip stream; see
+    /// [`TipStream::watch`](crate::tipstream::TipStream::watch).
+    #[cfg(feature = "tip-stream")]
+    pub fn tip_watch(&self) -> crate::tipstream::TipWatch {
+        crate::tipstream::TipStream::watch_with(
+            self.tip_stream_url(),
+            self.inner.timeout,
+            crate::tipstream::DEFAULT_READ_TIMEOUT,
+        )
+    }
+
+    #[cfg(feature = "tip-stream")]
+    fn tip_stream_url(&self) -> String {
+        let ws_base = self
+            .inner
+            .tip_api_base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        format!("{ws_base}/tip_stream?c={}", self.inner.api_key_encoded)
     }
 
     /// Send a signed `VersionedTransaction`, after checking locally that it carries
     /// a tip of at least the minimum. Uses API v2 and returns the transaction's
     /// first signature, computed locally.
+    ///
+    /// The check resolves static account keys only. A system transfer whose
+    /// destination is loaded from an address lookup table is refused with
+    /// [`Error::TipUnresolved`] rather than guessed at; pass the loaded
+    /// addresses to [`send_transaction_with_loaded`](Self::send_transaction_with_loaded)
+    /// to check it exactly, or use
+    /// [`send_transaction_unchecked`](Self::send_transaction_unchecked).
     #[cfg(feature = "solana")]
     pub async fn send_transaction(
         &self,
         tx: &solana_transaction::versioned::VersionedTransaction,
     ) -> Result<String> {
-        let inspection = crate::tip::inspect(tx);
+        self.send_transaction_with_loaded(tx, &[]).await
+    }
+
+    /// Like [`send_transaction`](Self::send_transaction), with the addresses
+    /// the transaction loads from its lookup tables so a tip whose destination
+    /// lives there is checked exactly. `loaded` is the writable loaded
+    /// addresses followed by the readonly ones, in table order, the same
+    /// layout the runtime uses (`LoadedAddresses::writable` then `readonly`).
+    #[cfg(feature = "solana")]
+    #[instrument(
+        skip(self, tx, loaded),
+        fields(region = %self.inner.region, tip_lamports = tracing::field::Empty)
+    )]
+    pub async fn send_transaction_with_loaded(
+        &self,
+        tx: &solana_transaction::versioned::VersionedTransaction,
+        loaded: &[solana_pubkey::Pubkey],
+    ) -> Result<String> {
+        let inspection = crate::tip::inspect_with_loaded(tx, loaded);
         if let Err(e) = inspection.check() {
             self.inner
                 .stats
@@ -499,8 +610,27 @@ impl Client {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(e);
         }
-        let bytes = crate::tip::serialize(tx)?;
         tracing::Span::current().record("tip_lamports", inspection.total_lamports());
+        self.send_versioned(tx).await
+    }
+
+    /// Send a signed `VersionedTransaction` without inspecting it for a tip.
+    /// Nozomi still drops under-tipped transactions silently.
+    #[cfg(feature = "solana")]
+    #[instrument(skip(self, tx), fields(region = %self.inner.region))]
+    pub async fn send_transaction_unchecked(
+        &self,
+        tx: &solana_transaction::versioned::VersionedTransaction,
+    ) -> Result<String> {
+        self.send_versioned(tx).await
+    }
+
+    #[cfg(feature = "solana")]
+    async fn send_versioned(
+        &self,
+        tx: &solana_transaction::versioned::VersionedTransaction,
+    ) -> Result<String> {
+        let bytes = crate::tip::serialize(tx)?;
         self.send(&bytes).await?;
         Ok(tx
             .signatures
@@ -536,6 +666,56 @@ mod tests {
             "http://tyo1.nozomi.temporal.xyz/api/sendTransaction2?c=k"
         );
         assert_eq!(c.url("/"), "http://tyo1.nozomi.temporal.xyz/?c=k");
+        let c = Client::builder()
+            .api_key("ab c#d&e\n")
+            .region(Region::Tokyo)
+            .route(Route::Direct { tls: false })
+            .build()
+            .unwrap();
+        assert_eq!(
+            c.url("/ping"),
+            "http://tyo1.nozomi.temporal.xyz/ping?c=ab%20c%23d%26e%0A"
+        );
+    }
+
+    #[test]
+    fn tip_api_base_is_normalized() {
+        let c = Client::builder()
+            .api_key("k")
+            .tip_api_base("https://api.example.test/")
+            .build()
+            .unwrap();
+        assert_eq!(c.inner.tip_api_base, "https://api.example.test");
+        assert!(matches!(
+            Client::builder()
+                .api_key("k")
+                .tip_api_base("api.example.test")
+                .build(),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let b = Client::builder().api_key("SECRETKEY");
+        assert!(!format!("{b:?}").contains("SECRETKEY"));
+        let c = b.build().unwrap();
+        assert!(!format!("{c:?}").contains("SECRETKEY"));
+    }
+
+    #[test]
+    fn base_url_override() {
+        let c = Client::builder()
+            .api_key("k")
+            .base_url("http://127.0.0.1:8080/")
+            .build()
+            .unwrap();
+        assert_eq!(c.base_url(), "http://127.0.0.1:8080");
+        assert_eq!(c.url("/ping"), "http://127.0.0.1:8080/ping?c=k");
+        assert!(matches!(
+            Client::builder().api_key("k").base_url("localhost").build(),
+            Err(Error::Config(_))
+        ));
     }
 
     #[test]
@@ -551,6 +731,7 @@ mod tests {
 
     #[test]
     fn frame_batch_enforces_limits() {
+        assert!(matches!(Client::frame_batch(&[]), Err(Error::EmptyBatch)));
         let ok = vec![0u8; 100];
         let seventeen: Vec<&[u8]> = (0..17).map(|_| ok.as_slice()).collect();
         assert!(matches!(

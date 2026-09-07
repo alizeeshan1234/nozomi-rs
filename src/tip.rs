@@ -55,32 +55,63 @@ pub struct TipTransfer {
     pub lamports: u64,
 }
 
+/// A system transfer whose destination is loaded from an address lookup table.
+/// It may or may not be a Nozomi tip; that cannot be decided without the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedTransfer {
+    /// Index of the instruction that carries the transfer.
+    pub instruction_index: usize,
+    /// Lamports transferred.
+    pub lamports: u64,
+}
+
 /// Result of scanning a transaction for tips.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TipInspection {
+    /// Transfers to a Nozomi tip account whose destination is a static key.
     pub tips: Vec<TipTransfer>,
+    /// Transfers whose destination comes from an address lookup table. Not
+    /// counted in [`total_lamports`](Self::total_lamports); see [`check`](Self::check).
+    pub unresolved: Vec<UnresolvedTransfer>,
 }
 
 impl TipInspection {
-    /// Sum of all tip transfers found.
+    /// Sum of all resolved tip transfers found.
     pub fn total_lamports(&self) -> u64 {
         self.tips.iter().map(|t| t.lamports).sum()
     }
 
+    /// Sum of transfers to lookup-table addresses. An upper bound on any tip
+    /// this scan could not attribute.
+    pub fn unresolved_lamports(&self) -> u64 {
+        self.unresolved.iter().map(|t| t.lamports).sum()
+    }
+
     /// Ok if the transaction carries at least the minimum tip, otherwise the
     /// error Nozomi would never send you.
+    ///
+    /// Only resolved tips count. If they fall short and there are unresolved
+    /// transfers, the answer is [`Error::TipUnresolved`](crate::Error::TipUnresolved)
+    /// rather than a guess either way: resolve the lookup-table addresses with
+    /// [`inspect_with_loaded`] to get a definite answer.
     pub fn check(&self) -> crate::Result<()> {
+        let resolved = self.total_lamports();
+        if resolved >= MIN_TIP_LAMPORTS {
+            return Ok(());
+        }
+        if !self.unresolved.is_empty() {
+            return Err(crate::Error::TipUnresolved {
+                resolved_lamports: resolved,
+                unresolved_lamports: self.unresolved_lamports(),
+            });
+        }
         if self.tips.is_empty() {
             return Err(crate::Error::MissingTip);
         }
-        let total = self.total_lamports();
-        if total < MIN_TIP_LAMPORTS {
-            return Err(crate::Error::TipBelowMinimum {
-                lamports: total,
-                minimum: MIN_TIP_LAMPORTS,
-            });
-        }
-        Ok(())
+        Err(crate::Error::TipBelowMinimum {
+            lamports: resolved,
+            minimum: MIN_TIP_LAMPORTS,
+        })
     }
 }
 
@@ -140,13 +171,30 @@ mod with_solana {
 
     /// Scan a transaction for system transfers to Nozomi tip accounts.
     ///
-    /// Only static account keys are resolved. A tip whose destination comes from
-    /// an address lookup table cannot be verified offline and is not counted.
+    /// Only static account keys are resolved. A transfer whose destination
+    /// index points past the static keys, into addresses loaded from an
+    /// address lookup table, is reported in
+    /// [`TipInspection::unresolved`] rather than counted as a tip. Use
+    /// [`inspect_with_loaded`] when you have the loaded addresses.
     pub fn inspect(tx: &VersionedTransaction) -> TipInspection {
+        inspect_with_loaded(tx, &[])
+    }
+
+    /// Like [`inspect`], with the addresses the transaction loads from its
+    /// lookup tables, so destinations there are resolved too. `loaded` is the
+    /// writable loaded addresses followed by the readonly ones, in table order,
+    /// which is how the runtime numbers them after the static keys. Indices
+    /// past both lists are still reported as unresolved.
+    pub fn inspect_with_loaded(tx: &VersionedTransaction, loaded: &[Pubkey]) -> TipInspection {
         let system_id = solana_system_interface::program::ID;
         let keys = tx.message.static_account_keys();
+        let uses_lookups = tx
+            .message
+            .address_table_lookups()
+            .is_some_and(|l| !l.is_empty());
         let tips_set = tip_pubkeys();
         let mut tips = Vec::new();
+        let mut unresolved = Vec::new();
         for (i, ix) in tx.message.instructions().iter().enumerate() {
             let Some(program) = keys.get(ix.program_id_index as usize) else {
                 continue;
@@ -160,18 +208,25 @@ mod with_solana {
             let Some(&to_idx) = ix.accounts.get(1) else {
                 continue;
             };
-            let Some(to) = keys.get(to_idx as usize) else {
-                continue;
-            };
-            if tips_set.contains(to) {
-                tips.push(TipTransfer {
+            let to_idx = to_idx as usize;
+            let to = keys
+                .get(to_idx)
+                .or_else(|| loaded.get(to_idx.wrapping_sub(keys.len())));
+            match to {
+                Some(to) if tips_set.contains(to) => tips.push(TipTransfer {
                     instruction_index: i,
                     to: to.to_string(),
                     lamports,
-                });
+                }),
+                Some(_) => {}
+                None if uses_lookups => unresolved.push(UnresolvedTransfer {
+                    instruction_index: i,
+                    lamports,
+                }),
+                None => {}
             }
         }
-        TipInspection { tips }
+        TipInspection { tips, unresolved }
     }
 
     /// Serialize a signed transaction to the wire bytes Nozomi expects.
@@ -221,6 +276,7 @@ mod tests {
                 to: TIP_ACCOUNTS[0].into(),
                 lamports: 999_999,
             }],
+            ..Default::default()
         };
         assert!(matches!(
             low.check(),
@@ -235,8 +291,59 @@ mod tests {
                 to: TIP_ACCOUNTS[0].into(),
                 lamports: 1_000_000,
             }],
+            ..Default::default()
         };
         assert!(ok.check().is_ok());
+    }
+
+    #[test]
+    fn unresolved_transfers_are_reported_not_guessed() {
+        let via_lookup = TipInspection {
+            tips: vec![],
+            unresolved: vec![UnresolvedTransfer {
+                instruction_index: 0,
+                lamports: 1_000_000,
+            }],
+        };
+        assert!(matches!(
+            via_lookup.check(),
+            Err(crate::Error::TipUnresolved {
+                resolved_lamports: 0,
+                unresolved_lamports: 1_000_000
+            })
+        ));
+        // A real static tip that meets the minimum passes regardless.
+        let enough = TipInspection {
+            tips: vec![TipTransfer {
+                instruction_index: 0,
+                to: TIP_ACCOUNTS[0].into(),
+                lamports: 1_000_000,
+            }],
+            unresolved: vec![UnresolvedTransfer {
+                instruction_index: 1,
+                lamports: 5,
+            }],
+        };
+        assert!(enough.check().is_ok());
+        // A short static tip plus an unresolved transfer is still unresolved.
+        let short = TipInspection {
+            tips: vec![TipTransfer {
+                instruction_index: 0,
+                to: TIP_ACCOUNTS[0].into(),
+                lamports: 500_000,
+            }],
+            unresolved: vec![UnresolvedTransfer {
+                instruction_index: 1,
+                lamports: 1_000_000_000,
+            }],
+        };
+        assert!(matches!(
+            short.check(),
+            Err(crate::Error::TipUnresolved {
+                resolved_lamports: 500_000,
+                ..
+            })
+        ));
     }
 
     #[cfg(feature = "solana")]
@@ -260,5 +367,86 @@ mod tests {
         assert!(found.check().is_ok());
         let bytes = serialize(&tx).unwrap();
         assert!(bytes.len() >= crate::MIN_TX_BYTES && bytes.len() <= crate::MAX_TX_BYTES);
+    }
+
+    /// A v0 transaction whose only system transfer goes to account index 2,
+    /// the first writable address loaded from a lookup table.
+    #[cfg(feature = "solana")]
+    fn v0_transfer_to_loaded_address(
+        lamports: u64,
+    ) -> solana_transaction::versioned::VersionedTransaction {
+        use solana_message::v0::{Message as V0Message, MessageAddressTableLookup};
+        use solana_message::{MessageHeader, VersionedMessage};
+        use solana_pubkey::Pubkey;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let payer = Pubkey::new_unique();
+        let system = solana_system_interface::program::ID;
+        let mut data = vec![2, 0, 0, 0];
+        data.extend_from_slice(&lamports.to_le_bytes());
+        let msg = V0Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![payer, system],
+            recent_blockhash: Default::default(),
+            instructions: vec![solana_message::compiled_instruction::CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0, 2],
+                data,
+            }],
+            address_table_lookups: vec![MessageAddressTableLookup {
+                account_key: Pubkey::new_unique(),
+                writable_indexes: vec![0],
+                readonly_indexes: vec![],
+            }],
+        };
+        VersionedTransaction {
+            signatures: vec![Default::default()],
+            message: VersionedMessage::V0(msg),
+        }
+    }
+
+    #[cfg(feature = "solana")]
+    #[test]
+    fn inspect_reports_lookup_table_destination_as_unresolved() {
+        let tx = v0_transfer_to_loaded_address(1_500_000);
+        let found = inspect(&tx);
+        assert!(found.tips.is_empty());
+        assert_eq!(found.unresolved.len(), 1);
+        assert_eq!(found.unresolved_lamports(), 1_500_000);
+        assert!(matches!(
+            found.check(),
+            Err(crate::Error::TipUnresolved {
+                resolved_lamports: 0,
+                unresolved_lamports: 1_500_000
+            })
+        ));
+    }
+
+    #[cfg(feature = "solana")]
+    #[test]
+    fn inspect_with_loaded_resolves_lookup_table_destination() {
+        use solana_pubkey::Pubkey;
+        let tx = v0_transfer_to_loaded_address(1_500_000);
+
+        // The loaded address is a tip account: a real, checkable tip.
+        let found = inspect_with_loaded(&tx, &[tip_pubkeys()[4]]);
+        assert_eq!(found.tips.len(), 1);
+        assert_eq!(found.tips[0].to, TIP_ACCOUNTS[4]);
+        assert!(found.unresolved.is_empty());
+        assert!(found.check().is_ok());
+
+        // The loaded address is someone else: definitely no tip.
+        let found = inspect_with_loaded(&tx, &[Pubkey::new_unique()]);
+        assert!(found.tips.is_empty());
+        assert!(found.unresolved.is_empty());
+        assert!(matches!(found.check(), Err(crate::Error::MissingTip)));
+
+        // Too few loaded addresses: still unresolved.
+        let found = inspect_with_loaded(&tx, &[]);
+        assert_eq!(found.unresolved.len(), 1);
     }
 }

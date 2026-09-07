@@ -12,7 +12,7 @@ Every Nozomi transaction carries a system transfer to one of 17 published tip ac
 
 ## 1. Reverted transactions do not pay the tip
 
-The docs say: "a reverted transaction that includes the tip still pays."
+The [troubleshooting page](https://use.temporal.xyz/nozomi/troubleshooting.md) says: "a reverted transaction that includes the tip still pays." The [tipping FAQ](https://use.temporal.xyz/nozomi/tipping-and-faq.md) says the opposite: "if the transaction fails, the tip is never charged." Checked 2026-09-07; both pages were live at once.
 
 On-chain, on a reverted Nozomi-tipped transaction (`47ZqgUey…`, slot 444055950):
 
@@ -23,7 +23,7 @@ On-chain, on a reverted Nozomi-tipped transaction (`47ZqgUey…`, slot 444055950
 | tip account balance after | 890,880 |
 | payer balance change | −13,166 (the fee) |
 
-Solana transactions are atomic. When instruction 4 failed, the tip transfer in instruction 0 was rolled back with it. The payer was charged the base and priority fee and nothing else. The docs conflate fee with tip. For a user this is good news; for anyone doing tip accounting it means "tip in transaction" and "tip received" are different columns.
+Solana transactions are atomic. When instruction 4 failed, the tip transfer in instruction 0 was rolled back with it. The payer was charged the base and priority fee and nothing else. The troubleshooting page conflates fee with tip; the FAQ has it right. For a user this is good news; for anyone doing tip accounting it means "tip in transaction" and "tip received" are different columns.
 
 `nozomi-client`'s `Verifier` reports both: `tip_intended_lamports` from the instruction, `tip_paid_lamports` from pre/post balances.
 
@@ -68,6 +68,27 @@ Put 1 and 2 together. Nearly 99% of the transactions that carry a Nozomi tip rev
 ## 4. Live tip floor
 
 `GET api.nozomi.temporal.xyz/tip_floor` on 2026-09-03: p25 0.0011 SOL, p50 0.005, p75 0.011, p95 0.085. The API returns a one-element array, not an object; the client parses both.
+
+Re-checked 2026-09-07 13:50 UTC: three requests eight seconds apart returned all-`null` percentiles, an nginx 503 page, and all-`null` again. The websocket `tip_stream` on the same host was pushing complete frames every 15 seconds at the same time (all five percentiles 0.0021 SOL, no API key needed). By 14:05 UTC the REST endpoint was answering normally again (p50 0.0011 SOL, all percentiles present). Anyone sizing tips from the REST endpoint needs a fallback; the client returns the minimum tip for a missing percentile and exposes `is_complete()`.
+
+## 5. TLS and QUIC on the direct hosts are unreliable
+
+The endpoints page lists nine direct hosts with `https://` and the QUIC client's README lists the same nine on UDP 443. Measured 2026-09-07 from one vantage point with `cargo run --example smoke --all-features` and a curl loop. Every host resolves to a single IPv4 address; `pit1` and `ewr1` share one, and `edge` (QUIC geo-DNS) resolved to `sgp1`'s address from here.
+
+Ten TLS handshakes to `https://<host>/ping`, 14:30 UTC (each attempt is a fresh TCP connection; a failure is a reset at the ClientHello):
+
+| host | TLS successes / 10 | QUIC (H3, 443), three runs 13:52 to 14:30 |
+|---|---|---|
+| ash1, lon1 | 10 | handshake OK, 401 without key, all three runs |
+| sgp1 | 3 | OK all three runs |
+| fra2 | 2 | OK at 13:52 and 14:05, refused at 14:30 |
+| ams1 | 1 | refused all three runs |
+| pit1, ewr1, lax1, tyo1 | 0 | refused all three runs |
+| edge | | OK at 13:52 and 14:05, refused at 14:30 |
+| plain `http://`, all nine | 10 | |
+| Cloudflare hosts, all nine plus auto | 10 | |
+
+So it is not a missing listener per host. TLS on 443 answers some connections and resets others, and the success rate differs by host and drifts over minutes; QUIC on the same hosts fails and recovers on the same schedule. That pattern fits a TLS-terminating front end that is rate-limiting or overloaded, or several backends behind one address with only some of them healthy. Plain HTTP on the same hosts, which the docs recommend from a datacenter anyway, never failed. Anyone using `Route::Direct { tls: true }` or QUIC should expect connect failures and keep the Cloudflare route or plain HTTP as a fallback; the QUIC client reconnects on its own, but a handshake that is refused stays refused until the host recovers.
 
 ## Open questions
 

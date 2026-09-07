@@ -7,8 +7,10 @@
 //! Those last two differ on a reverted transaction. Solana transactions are
 //! atomic: if any instruction fails, every instruction is rolled back, including
 //! the tip transfer. Only the base and priority fee are charged. Nozomi's docs
-//! state that a reverted transaction "still pays" the tip; on-chain balances show
-//! it does not. This module reports both numbers so you can see it yourself.
+//! disagree with themselves here: the troubleshooting page says a reverted
+//! transaction "still pays", the tipping FAQ says the tip "is never charged".
+//! On-chain balances agree with the FAQ. This module reports both numbers so
+//! you can see it yourself.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -70,11 +72,29 @@ impl LandingReport {
 
 /// Looks up transactions on a Solana RPC. Uses `getTransaction` with
 /// `jsonParsed` so it works without any Solana crates.
-#[derive(Debug, Clone)]
+///
+/// `Debug` output redacts the RPC URL, since hosted RPC URLs usually carry an
+/// API key in the query string. Transport and decode errors have their URL
+/// stripped for the same reason.
+#[derive(Clone)]
 pub struct Verifier {
     http: reqwest::Client,
     rpc_url: String,
+    /// Known when this crate built the client; `None` for `with_client`.
+    timeout: Option<std::time::Duration>,
 }
+
+impl std::fmt::Debug for Verifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Verifier")
+            .field("rpc_url", &crate::util::REDACTED)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+/// Default per-request timeout for [`Verifier::new`].
+pub const DEFAULT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One entry from `getSignaturesForAddress`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,24 +114,44 @@ impl SignatureInfo {
 }
 
 impl Verifier {
+    /// Verifier against `rpc_url` with a 30-second per-request timeout.
     pub fn new(rpc_url: impl Into<String>) -> Self {
+        Self::with_timeout(rpc_url, DEFAULT_RPC_TIMEOUT)
+    }
+
+    /// Verifier against `rpc_url` with a custom per-request timeout.
+    pub fn with_timeout(rpc_url: impl Into<String>, timeout: std::time::Duration) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("reqwest client with only a timeout set always builds");
         Self {
-            http: reqwest::Client::new(),
+            http,
             rpc_url: rpc_url.into(),
+            timeout: Some(timeout),
         }
     }
 
-    /// Build from an existing client, to share a connection pool.
+    /// Build from an existing client, to share a connection pool. Set a timeout
+    /// on it yourself; this constructor does not add one, and a timeout it
+    /// raises is reported as [`Error::Timeout`] with `after: None`.
     pub fn with_client(http: reqwest::Client, rpc_url: impl Into<String>) -> Self {
         Self {
             http,
             rpc_url: rpc_url.into(),
+            timeout: None,
         }
     }
 
     async fn rpc(&self, method: &str, params: Value) -> crate::Result<Value> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp = self.http.post(&self.rpc_url).json(&body).send().await?;
+        let resp = self
+            .http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest(e, self.timeout))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::Http {
@@ -122,7 +162,7 @@ impl Verifier {
         let v: Value = resp
             .json()
             .await
-            .map_err(|e| Error::Decode(e.to_string()))?;
+            .map_err(|e| Error::decode_reqwest(e, self.timeout))?;
         if let Some(err) = v.get("error") {
             return Err(Error::Rpc {
                 code: err.get("code").and_then(|c| c.as_i64()).unwrap_or(0),

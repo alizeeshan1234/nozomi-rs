@@ -21,7 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _keepalive = client.spawn_keepalive();
 
     let floor = client.tip_floor().await?;
-    println!("tip floor p50 = {} SOL", floor.landed_tips_50th_percentile);
+    println!(
+        "tip floor p50 = {:?} SOL",
+        floor.landed_tips_50th_percentile
+    );
 
     client.send(&tx).await?;
     println!("accepted; stats: {:?}", client.stats());

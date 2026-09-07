@@ -1,7 +1,11 @@
 use std::fmt;
 
 /// A Nozomi region. `Auto` resolves to the nearest region through Cloudflare.
+///
+/// Marked `#[non_exhaustive]`: Temporal adds regions, and a minor release will
+/// add them here. Keep a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Region {
     /// `nozomi.temporal.xyz`, routed to the nearest region via Cloudflare. HTTPS only.
     Auto,
@@ -22,6 +26,19 @@ pub enum Region {
 /// recommend for the lowest latency from a datacenter. `Cloudflare` goes through
 /// the proxied host over HTTPS and is the better choice from residential or mobile
 /// networks. `Region::Auto` is always Cloudflare.
+///
+/// `Direct { tls: false }` puts the API key on the wire in cleartext, in the
+/// query string of every request. Use it from inside a datacenter with a
+/// trusted path to the host, not across the open internet.
+///
+/// TLS on the direct hosts is unreliable. Measured 2026-09-07: ten fresh
+/// handshakes to each host's `https://` port succeeded 10/10 on Ashburn and
+/// London, 3/10 on Singapore, 2/10 on Frankfurt, 1/10 on Amsterdam, and 0/10
+/// on Pittsburgh, Newark, Los Angeles, and Tokyo, with the failures being a
+/// reset at the ClientHello; QUIC on the same hosts failed and recovered on
+/// the same schedule. Plain `http://` and the Cloudflare route never failed.
+/// Keep one of those as a fallback, and run
+/// `cargo run --example smoke --all-features` to re-check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Route {
     Direct { tls: bool },
@@ -29,8 +46,9 @@ pub enum Route {
 }
 
 impl Region {
-    /// All fixed regions, in the order the docs list them.
-    pub const ALL: [Region; 9] = [
+    /// All fixed regions, in the order the docs list them. A slice, not an
+    /// array, so adding a region is not a breaking change.
+    pub const ALL: &'static [Region] = &[
         Region::Pittsburgh,
         Region::Newark,
         Region::Ashburn,
@@ -68,6 +86,16 @@ impl Region {
         match self.code() {
             None => "nozomi.temporal.xyz".to_string(),
             Some(code) => format!("{code}.nozomi.temporal.xyz"),
+        }
+    }
+
+    /// Host for HTTP/3 over QUIC on port 443. Always a direct host; there is
+    /// no Cloudflare route for QUIC. `Auto` is `edge.nozomi.temporal.xyz`,
+    /// which geo-DNS resolves to the nearest region.
+    pub fn quic_host(self) -> String {
+        match self.direct_host() {
+            Some(h) => h,
+            None => "edge.nozomi.temporal.xyz".to_string(),
         }
     }
 
@@ -141,5 +169,8 @@ mod tests {
             Region::Singapore.base_url(Route::Direct { tls: true }),
             "https://sgp1.nozomi.temporal.xyz"
         );
+        assert_eq!(Region::Auto.quic_host(), "edge.nozomi.temporal.xyz");
+        assert_eq!(Region::Frankfurt.quic_host(), "fra2.nozomi.temporal.xyz");
+        assert_eq!(Region::London.quic_host(), "lon1.nozomi.temporal.xyz");
     }
 }
