@@ -41,6 +41,9 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write # the action posts its report as a check run
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

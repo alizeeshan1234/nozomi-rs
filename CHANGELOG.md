@@ -17,6 +17,7 @@
 - `TipStream::watch`, `TipWatch`, and `Client::tip_watch`: a reconnecting background subscription that keeps the latest tip floor in a `watch` channel, for reading at send time without touching the network.
 - `Region::quic_host`, `Error::Timeout`, `Error::Quic`, `Error::WebSocket`, `Error::EmptyBatch`, `Error::TipUnresolved`, `TipFloor::is_complete`, `TipWatch::latest_lamports`, `TipStream::connect_with` and `watch_with` with connect and per-frame read timeouts (defaults 10 s and 45 s).
 - The API key is percent-encoded into the query string on every transport, so a key with a stray newline, space, or `#` fails loudly at build or is sent intact instead of truncating the URL.
+- Transactions are serialized with `wincode` instead of `bincode` 1.x, which is unmaintained (RUSTSEC-2025-0141). The bytes are identical; a test pins the wire format to the Solana encoding. bincode is no longer in the dependency tree at all.
 - `LICENSE-MIT` and `LICENSE-APACHE` files, which the manifest already declared.
 - CI runs the full feature matrix, an MSRV (1.91) check, strict rustdoc, and `cargo audit`.
 - Mock-server test suites for every network path (HTTP, QUIC, websocket, RPC) and a live `smoke` example.

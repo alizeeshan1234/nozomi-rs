@@ -229,9 +229,11 @@ mod with_solana {
         TipInspection { tips, unresolved }
     }
 
-    /// Serialize a signed transaction to the wire bytes Nozomi expects.
+    /// Serialize a signed transaction to the wire bytes Nozomi expects: the
+    /// standard Solana encoding (short-vec signature count, signatures,
+    /// message), byte-identical to `bincode::serialize` on the same value.
     pub fn serialize(tx: &VersionedTransaction) -> crate::Result<Vec<u8>> {
-        bincode::serialize(tx).map_err(|e| crate::Error::Serialize(e.to_string()))
+        wincode::serialize(tx).map_err(|e| crate::Error::Serialize(e.to_string()))
     }
 }
 
@@ -367,6 +369,39 @@ mod tests {
         assert!(found.check().is_ok());
         let bytes = serialize(&tx).unwrap();
         assert!(bytes.len() >= crate::MIN_TX_BYTES && bytes.len() <= crate::MAX_TX_BYTES);
+    }
+
+    /// The wire format is fixed by the Solana runtime: a short-vec length,
+    /// the signatures, then the serialized message. Anything else and Nozomi
+    /// forwards garbage.
+    #[cfg(feature = "solana")]
+    #[test]
+    fn serialize_is_the_solana_wire_format() {
+        use solana_message::{Message, VersionedMessage};
+        use solana_pubkey::Pubkey;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        for (n_sigs, msg) in [
+            (
+                1usize,
+                VersionedMessage::Legacy(Message::new(
+                    &[tip_instruction(&Pubkey::new_unique(), 2_000_000)],
+                    Some(&Pubkey::new_unique()),
+                )),
+            ),
+            (1usize, v0_transfer_to_loaded_address(7).message),
+        ] {
+            let tx = VersionedTransaction {
+                signatures: (0..n_sigs).map(|_| Default::default()).collect(),
+                message: msg,
+            };
+            let mut expected = vec![n_sigs as u8]; // short-vec of a length < 128
+            for s in &tx.signatures {
+                expected.extend_from_slice(s.as_ref());
+            }
+            expected.extend_from_slice(&tx.message.serialize());
+            assert_eq!(serialize(&tx).unwrap(), expected);
+        }
     }
 
     /// A v0 transaction whose only system transfer goes to account index 2,
