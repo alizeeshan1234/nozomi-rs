@@ -27,16 +27,17 @@ async fn serve_once(frames: Vec<Message>) -> (u16, tokio::sync::oneshot::Receive
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut path = String::new();
-        let ws = tokio_tungstenite::accept_hdr_async(
-            stream,
+        // The callback's error type is fixed by tungstenite and is large.
+        #[allow(clippy::result_large_err)]
+        let record_path =
             |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
              resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
                 path = req.uri().to_string();
                 Ok(resp)
-            },
-        )
-        .await
-        .unwrap();
+            };
+        let ws = tokio_tungstenite::accept_hdr_async(stream, record_path)
+            .await
+            .unwrap();
         let _ = tx.send(path);
         let (mut sink, mut source) = ws.split();
         for f in frames {

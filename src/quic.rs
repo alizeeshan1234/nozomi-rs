@@ -604,26 +604,66 @@ fn endpoint_for(inner: &Inner, addr: SocketAddr) -> Result<quinn::Endpoint> {
     Ok(ep)
 }
 
+/// Resolve the host and race a QUIC handshake to every address at once; the
+/// first to complete wins and the rest are abandoned. A name with both A and
+/// AAAA records, or several A records with one dead, connects as fast as its
+/// best address instead of stalling on its first.
 async fn connect(inner: &Inner, generation: u64) -> Result<Conn> {
     let target = format!("{}:{}", inner.host_for_lookup, inner.port);
-    let addr = tokio::net::lookup_host(&target)
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&target)
         .await
         .map_err(|e| Error::Quic(format!("dns: {e}")))?
-        .next()
-        .ok_or_else(|| Error::Quic("dns: no addresses".into()))?;
-    let endpoint = endpoint_for(inner, addr)?;
-    let quic = endpoint
-        .connect(addr, &inner.server_name)
-        .map_err(|e| Error::Quic(format!("connect: {e}")))?
-        .await
-        .map_err(|e| Error::Quic(format!("handshake: {e}")))?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::Quic("dns: no addresses".into()));
+    }
+    let mut set = tokio::task::JoinSet::new();
+    let mut errors = Vec::new();
+    for addr in addrs {
+        let endpoint = match endpoint_for(inner, addr) {
+            Ok(ep) => ep,
+            Err(e) => {
+                // No socket for this family (an IPv6-less host, say); try the others.
+                errors.push(format!("{addr}: {e}"));
+                continue;
+            }
+        };
+        let server_name = inner.server_name.clone();
+        set.spawn(async move {
+            let result = async {
+                endpoint
+                    .connect(addr, &server_name)
+                    .map_err(|e| format!("connect: {e}"))?
+                    .await
+                    .map_err(|e| format!("handshake: {e}"))
+            }
+            .await;
+            (addr, result)
+        });
+    }
+    let quic = loop {
+        match set.join_next().await {
+            Some(Ok((addr, Ok(quic)))) => {
+                set.abort_all();
+                debug!(%addr, generation, "quic handshake complete");
+                break quic;
+            }
+            Some(Ok((addr, Err(e)))) => errors.push(format!("{addr}: {e}")),
+            Some(Err(e)) => errors.push(format!("task: {e}")),
+            None => {
+                return Err(Error::Quic(format!(
+                    "no address accepted the handshake ({})",
+                    errors.join("; ")
+                )))
+            }
+        }
+    };
     let (mut driver, send_request) = h3::client::new(h3_quinn::Connection::new(quic.clone()))
         .await
         .map_err(|e| Error::Quic(format!("h3 handshake: {e}")))?;
     let driver = tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
-    debug!(%addr, generation, "quic connected");
     Ok(Conn {
         quic,
         send_request,

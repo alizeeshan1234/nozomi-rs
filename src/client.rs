@@ -40,12 +40,10 @@ pub struct Stats {
 impl Stats {
     /// Mean round trip in microseconds, or 0 if nothing has been sent.
     pub fn mean_roundtrip_micros(&self) -> u64 {
-        let n = self.roundtrips.load(Ordering::Relaxed);
-        if n == 0 {
-            0
-        } else {
-            self.roundtrip_micros.load(Ordering::Relaxed) / n
-        }
+        self.roundtrip_micros
+            .load(Ordering::Relaxed)
+            .checked_div(self.roundtrips.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 }
 
