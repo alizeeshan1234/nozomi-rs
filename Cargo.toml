@@ -7,7 +7,7 @@ description = "Rust client for Nozomi, Temporal's Solana transaction landing ser
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alizeeshan1234/nozomi-rs"
 readme = "README.md"
-exclude = ["PITCH.md", ".github/"]
+exclude = ["PITCH.md", ".github/", "demo/"]
 keywords = ["solana", "nozomi", "temporal", "transaction", "landing"]
 categories = ["api-bindings", "cryptography::cryptocurrencies"]
 
@@ -57,3 +57,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wiremock = "0.6"
 # Only tests/quic.rs uses it, for a self-signed server certificate.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+
+[workspace]
+members = ["demo"]

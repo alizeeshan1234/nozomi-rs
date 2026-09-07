@@ -96,6 +96,14 @@ Percentiles are `Option<f64>`: the API returns all `null` when it has no recent 
 
 Every send is a `tracing` span with `region` and `bytes`; `send_transaction` adds `tip_lamports`. `Client::stats()` exposes atomic counters: submitted, accepted, rejected locally, rejected by server, transport errors, and mean round trip.
 
+## Demo
+
+`demo/` is a small application that uses the crate end to end: it sizes a tip from the live stream, builds and signs a real transaction, inspects it, sends it over HTTP or QUIC, and verifies it on-chain. Without a key it runs dry and shows the typed 401.
+
+```sh
+cargo run -p nozomi-demo
+```
+
 ## Testing
 
 `cargo test --all-features` runs 62 tests. Beyond the unit tests there are mock-server suites for every network path: `tests/http.rs` (HTTP client: encoding, headers, the key parameter, status-to-error mapping, batch framing on the wire, ping, keep-alive task, tip floor), `tests/quic.rs` (a local HTTP/3 server with a self-signed cert: framing, status mapping, lazy connect, eviction of a stalled connection, recovery from a burst during an outage, timeout), `tests/tipstream.rs` (a local websocket server), and `tests/verify_http.rs` (a mock Solana RPC). Every suite asserts that no error ever prints an API key.
